@@ -1,8 +1,36 @@
 
-🦞 Openwork Escrow Indexer running on port 3456
+🦞 Openwork Escrow Indexer v1.1.0 (OWASP hardened)
+   Listening: 127.0.0.1:3456
    Contract: 0x80B2880C6564c6a9Bc1219686eF144e7387c20a3
    Chain: Base
+   Logs: ./access.log
 
 Starting initial sync...
-[2026-01-31T15:20:23.061Z] Syncing blocks 41541723 to 41541737...
-[2026-01-31T15:20:23.186Z] Sync complete. Processed 0 events. Last block: 41541737
+[2026-01-31T15:24:19.077Z] Syncing blocks 41541835 to 41541855...
+[2026-01-31T15:24:19.219Z] Sync complete. Processed 0 events. Last block: 41541855
+ValidationError: The 'X-Forwarded-For' header is set but the Express 'trust proxy' setting is false (default). This could indicate a misconfiguration which would prevent express-rate-limit from accurately identifying users. See https://express-rate-limit.github.io/ERR_ERL_UNEXPECTED_X_FORWARDED_FOR/ for more information.
+    at Object.xForwardedForHeader (/root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:366:13)
+    at wrappedValidations.<computed> [as xForwardedForHeader] (/root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:680:22)
+    at Object.keyGenerator (/root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:783:20)
+    at /root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:844:32
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async /root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:825:5 {
+  code: 'ERR_ERL_UNEXPECTED_X_FORWARDED_FOR',
+  help: 'https://express-rate-limit.github.io/ERR_ERL_UNEXPECTED_X_FORWARDED_FOR/'
+}
+2026-01-31T15:24:20.720Z GET /health 200 7.375 ms - 127.0.0.1 curl/7.81.0
+ValidationError: The 'X-Forwarded-For' header is set but the Express 'trust proxy' setting is false (default). This could indicate a misconfiguration which would prevent express-rate-limit from accurately identifying users. See https://express-rate-limit.github.io/ERR_ERL_UNEXPECTED_X_FORWARDED_FOR/ for more information.
+    at Object.xForwardedForHeader (/root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:366:13)
+    at wrappedValidations.<computed> [as xForwardedForHeader] (/root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:680:22)
+    at Object.keyGenerator (/root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:783:20)
+    at /root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:844:32
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async /root/escrow-indexer/node_modules/express-rate-limit/dist/index.cjs:825:5 {
+  code: 'ERR_ERL_UNEXPECTED_X_FORWARDED_FOR',
+  help: 'https://express-rate-limit.github.io/ERR_ERL_UNEXPECTED_X_FORWARDED_FOR/'
+}
+2026-01-31T15:24:26.523Z POST /sync 401 1.718 ms - 127.0.0.1 curl/7.81.0
+[2026-01-31T15:24:26.686Z] Syncing blocks 41541856 to 41541859...
+[2026-01-31T15:24:26.840Z] Sync complete. Processed 0 events. Last block: 41541859
+2026-01-31T15:24:26.843Z POST /sync 200 294.355 ms - 127.0.0.1 curl/7.81.0
+2026-01-31T15:24:26.854Z HEAD /health 200 0.569 ms - 127.0.0.1 curl/7.81.0

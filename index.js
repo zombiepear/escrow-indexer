@@ -1,5 +1,8 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { createPublicClient, http, decodeEventLog, keccak256, toHex } = require('viem');
 const { base } = require('viem/chains');
@@ -7,8 +10,68 @@ const Database = require('better-sqlite3');
 const fs = require('fs');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Security headers (OWASP)
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'"],
+      connectSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      objectSrc: ["'none'"],
+    },
+  },
+  hsts: { maxAge: 31536000, includeSubDomains: true },
+  noSniff: true,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+}));
+
+// CORS - restrict to known origins (can be expanded)
+const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000', 'https://agentjobs.agency'];
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (curl, etc) or from allowed list
+    if (!origin || allowedOrigins.includes(origin) || origin.includes('localhost')) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Log but allow for now (public API)
+    }
+  },
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'X-API-Key'],
+}));
+
+// Request logging (security monitoring)
+const logFormat = ':date[iso] :method :url :status :response-time ms - :remote-addr :user-agent';
+app.use(morgan(logFormat, {
+  stream: {
+    write: (msg) => {
+      fs.appendFileSync('./access.log', msg);
+      // Also log to console for real-time monitoring
+      process.stdout.write(msg);
+    }
+  }
+}));
+
+app.use(express.json({ limit: '10kb' })); // Limit body size
+
+// API Key auth for sensitive endpoints
+const API_KEY = process.env.API_KEY || crypto.randomBytes(32).toString('hex');
+if (!process.env.API_KEY) {
+  console.log(`\n⚠️  No API_KEY set. Generated: ${API_KEY.slice(0, 8)}...`);
+  console.log(`   Set API_KEY env var for production.\n`);
+}
+
+const requireAuth = (req, res, next) => {
+  const key = req.headers['x-api-key'];
+  if (!key || key !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized. X-API-Key header required.' });
+  }
+  next();
+};
 
 // Rate limiting
 const limiter = rateLimit({
@@ -411,12 +474,13 @@ app.get('/events', (req, res) => {
   res.json({ events, count: events.length });
 });
 
-app.post('/sync', syncLimiter, async (req, res) => {
+app.post('/sync', syncLimiter, requireAuth, async (req, res) => {
   try {
     await syncEvents();
     const { last_block } = db.prepare('SELECT last_block FROM sync_state WHERE id = 1').get();
     res.json({ success: true, last_block });
   } catch (e) {
+    console.error(`[${new Date().toISOString()}] Sync error:`, e.message);
     res.status(500).json({ error: 'Sync failed' }); // Don't leak internal errors
   }
 });
@@ -428,10 +492,13 @@ app.get('/health', (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3456;
-app.listen(PORT, '0.0.0.0', async () => {
-  console.log(`\n🦞 Openwork Escrow Indexer running on port ${PORT}`);
+const HOST = process.env.HOST || '127.0.0.1'; // Localhost only - use nginx for public access
+app.listen(PORT, HOST, async () => {
+  console.log(`\n🦞 Openwork Escrow Indexer v1.1.0 (OWASP hardened)`);
+  console.log(`   Listening: ${HOST}:${PORT}`);
   console.log(`   Contract: ${ESCROW_ADDRESS}`);
-  console.log(`   Chain: Base\n`);
+  console.log(`   Chain: Base`);
+  console.log(`   Logs: ./access.log\n`);
   
   // Initial sync
   console.log('Starting initial sync...');

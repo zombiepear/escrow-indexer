@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const { createPublicClient, http, decodeEventLog, keccak256, toHex } = require('viem');
 const { base } = require('viem/chains');
 const Database = require('better-sqlite3');
@@ -8,6 +9,43 @@ const fs = require('fs');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 100, // 100 requests per minute
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const syncLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5, // Only 5 sync requests per minute
+  message: { error: 'Sync rate limited. Try again in a minute.' },
+});
+
+app.use(limiter);
+
+// Input validation helpers
+const isValidHex = (str, exactLength = null) => {
+  if (typeof str !== 'string') return false;
+  const hex = str.startsWith('0x') ? str : '0x' + str;
+  if (!/^0x[a-fA-F0-9]+$/.test(hex)) return false;
+  if (exactLength && hex.length !== exactLength) return false;
+  return true;
+};
+
+const isValidAddress = (addr) => isValidHex(addr, 42); // 0x + 40 chars
+const isValidBytes32 = (b32) => isValidHex(b32, 66);   // 0x + 64 chars
+
+const sanitizeString = (str, maxLen = 100) => {
+  if (typeof str !== 'string') return '';
+  return str.slice(0, maxLen).replace(/[<>'"]/g, '');
+};
+
+const validateLimit = (val, max = 500) => Math.min(Math.max(parseInt(val) || 100, 1), max);
+const validateOffset = (val) => Math.max(parseInt(val) || 0, 0);
 
 // Config
 const ESCROW_ADDRESS = '0x80B2880C6564c6a9Bc1219686eF144e7387c20a3';
@@ -240,14 +278,16 @@ app.get('/', (req, res) => {
 });
 
 app.get('/jobs', (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-  const offset = parseInt(req.query.offset) || 0;
-  const status = req.query.status;
+  const limit = validateLimit(req.query.limit, 500);
+  const offset = validateOffset(req.query.offset);
+  const status = sanitizeString(req.query.status, 20);
+  
+  const validStatuses = ['open', 'claimed', 'submitted', 'verified', 'cancelled', 'claim_expired', 'verify_expired', 'emergency_released'];
   
   let query = 'SELECT * FROM jobs';
   const params = [];
   
-  if (status) {
+  if (status && validStatuses.includes(status)) {
     query += ' WHERE status = ?';
     params.push(status);
   }
@@ -256,7 +296,8 @@ app.get('/jobs', (req, res) => {
   params.push(limit, offset);
   
   const jobs = db.prepare(query).all(...params);
-  const total = db.prepare('SELECT COUNT(*) as count FROM jobs' + (status ? ' WHERE status = ?' : '')).get(...(status ? [status] : [])).count;
+  const countQuery = status && validStatuses.includes(status) ? 'SELECT COUNT(*) as count FROM jobs WHERE status = ?' : 'SELECT COUNT(*) as count FROM jobs';
+  const total = db.prepare(countQuery).get(...(status && validStatuses.includes(status) ? [status] : [])).count;
   
   res.json({ jobs, total, limit, offset });
 });
@@ -264,9 +305,14 @@ app.get('/jobs', (req, res) => {
 app.get('/jobs/:jobId', (req, res) => {
   let { jobId } = req.params;
   
-  // Handle both raw hex and 0x-prefixed
+  // Normalize to 0x prefix
   if (!jobId.startsWith('0x')) {
     jobId = '0x' + jobId;
+  }
+  
+  // Validate hex format (bytes32 = 66 chars with 0x)
+  if (!isValidBytes32(jobId)) {
+    return res.status(400).json({ error: 'Invalid jobId format. Expected bytes32 hex string.' });
   }
   
   const job = db.prepare('SELECT * FROM jobs WHERE job_id = ? OR job_id = ?').get(jobId, jobId.toLowerCase());
@@ -281,7 +327,7 @@ app.get('/jobs/:jobId', (req, res) => {
 });
 
 app.get('/agents', (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const limit = validateLimit(req.query.limit, 500);
   const agents = db.prepare('SELECT * FROM agents ORDER BY registered_block DESC LIMIT ?').all(limit);
   const total = db.prepare('SELECT COUNT(*) as count FROM agents').get().count;
   res.json({ agents, total });
@@ -290,8 +336,15 @@ app.get('/agents', (req, res) => {
 app.get('/agents/:address/jobs', (req, res) => {
   const { address } = req.params;
   
+  // Validate address format
+  if (!isValidAddress(address)) {
+    return res.status(400).json({ error: 'Invalid address format. Expected 0x + 40 hex chars.' });
+  }
+  
+  const normalizedAddr = address.toLowerCase();
+  
   // Try to find agent by wallet
-  const agent = db.prepare('SELECT * FROM agents WHERE LOWER(wallet) = ?').get(address.toLowerCase());
+  const agent = db.prepare('SELECT * FROM agents WHERE LOWER(wallet) = ?').get(normalizedAddr);
   
   let posted = [];
   let claimed = [];
@@ -300,12 +353,13 @@ app.get('/agents/:address/jobs', (req, res) => {
     posted = db.prepare('SELECT * FROM jobs WHERE poster_id = ?').all(agent.agent_id);
     claimed = db.prepare('SELECT * FROM jobs WHERE claimer_id = ?').all(agent.agent_id);
   } else {
-    // Search by partial match on poster/claimer fields
-    posted = db.prepare('SELECT * FROM jobs WHERE LOWER(poster_id) LIKE ?').all(`%${address.toLowerCase().slice(2, 10)}%`);
-    claimed = db.prepare('SELECT * FROM jobs WHERE LOWER(claimer_id) LIKE ?').all(`%${address.toLowerCase().slice(2, 10)}%`);
+    // Search by partial match on poster/claimer fields (first 8 chars of address)
+    const partial = normalizedAddr.slice(2, 10);
+    posted = db.prepare('SELECT * FROM jobs WHERE LOWER(poster_id) LIKE ?').all(`%${partial}%`);
+    claimed = db.prepare('SELECT * FROM jobs WHERE LOWER(claimer_id) LIKE ?').all(`%${partial}%`);
   }
   
-  res.json({ address, agent, posted, claimed });
+  res.json({ address: normalizedAddr, agent, posted, claimed });
 });
 
 app.get('/stats', (req, res) => {
@@ -333,13 +387,19 @@ app.get('/stats', (req, res) => {
 });
 
 app.get('/events', (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const eventType = req.query.type;
+  const limit = validateLimit(req.query.limit, 200);
+  const eventType = sanitizeString(req.query.type, 30);
+  
+  const validEventTypes = [
+    'AgentRegistered', 'JobPosted', 'JobClaimed', 'WorkSubmitted',
+    'JobVerified', 'JobCancelled', 'ClaimExpired', 'VerifyExpired',
+    'EmergencyRelease', 'OwnershipTransferred'
+  ];
   
   let query = 'SELECT * FROM events';
   const params = [];
   
-  if (eventType) {
+  if (eventType && validEventTypes.includes(eventType)) {
     query += ' WHERE event_type = ?';
     params.push(eventType);
   }
@@ -351,13 +411,13 @@ app.get('/events', (req, res) => {
   res.json({ events, count: events.length });
 });
 
-app.post('/sync', async (req, res) => {
+app.post('/sync', syncLimiter, async (req, res) => {
   try {
     await syncEvents();
     const { last_block } = db.prepare('SELECT last_block FROM sync_state WHERE id = 1').get();
     res.json({ success: true, last_block });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: 'Sync failed' }); // Don't leak internal errors
   }
 });
 

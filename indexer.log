@@ -1,0 +1,24 @@
+
+🦞 Openwork Escrow Indexer running on port 3456
+   Contract: 0x80B2880C6564c6a9Bc1219686eF144e7387c20a3
+   Chain: Base
+
+Starting initial sync...
+[2026-01-31T14:57:33.543Z] Syncing blocks 41000001 to 41541053...
+Error fetching 41500101-41505101: HTTP request failed.
+
+Status: 429
+URL: https://mainnet.base.org/
+Request body: {"method":"eth_getLogs","params":[{"address":"0x80B2880C6564c6a9Bc1219686eF144e7387c20a3","topics":[],"fromBlock":"0x2793dc5","toBlock":"0x279514d"}]}
+
+Details: {"code":-32016,"message":"over rate limit"}
+Version: viem@2.45.1
+Error fetching 41505102-41510102: HTTP request failed.
+
+Status: 429
+URL: https://mainnet.base.org/
+Request body: {"method":"eth_getLogs","params":[{"address":"0x80B2880C6564c6a9Bc1219686eF144e7387c20a3","topics":[],"fromBlock":"0x279514e","toBlock":"0x27964d6"}]}
+
+Details: {"code":-32016,"message":"over rate limit"}
+Version: viem@2.45.1
+[2026-01-31T14:57:52.246Z] Sync complete. Processed 22 events. Last block: 41541053

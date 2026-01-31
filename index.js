@@ -1,0 +1,382 @@
+const express = require('express');
+const cors = require('cors');
+const { createPublicClient, http, decodeEventLog, keccak256, toHex } = require('viem');
+const { base } = require('viem/chains');
+const Database = require('better-sqlite3');
+const fs = require('fs');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Config
+const ESCROW_ADDRESS = '0x80B2880C6564c6a9Bc1219686eF144e7387c20a3';
+const START_BLOCK = 41000000n;
+const abi = JSON.parse(fs.readFileSync('./abi.json', 'utf8'));
+
+// Database setup
+const db = new Database('./escrow.db');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    title TEXT,
+    poster_id TEXT,
+    claimer_id TEXT,
+    reward TEXT,
+    status TEXT DEFAULT 'open',
+    submission_hash TEXT,
+    approved INTEGER,
+    created_block INTEGER,
+    claimed_block INTEGER,
+    submitted_block INTEGER,
+    verified_block INTEGER,
+    cancelled_block INTEGER,
+    created_at INTEGER,
+    updated_at INTEGER
+  );
+  
+  CREATE TABLE IF NOT EXISTS agents (
+    agent_id TEXT PRIMARY KEY,
+    name TEXT,
+    wallet TEXT,
+    registered_block INTEGER,
+    created_at INTEGER
+  );
+  
+  CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT,
+    job_id TEXT,
+    agent_id TEXT,
+    tx_hash TEXT,
+    block_number INTEGER,
+    log_index INTEGER,
+    data TEXT,
+    created_at INTEGER
+  );
+  
+  CREATE TABLE IF NOT EXISTS sync_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_block INTEGER
+  );
+  
+  CREATE INDEX IF NOT EXISTS idx_jobs_poster ON jobs(poster_id);
+  CREATE INDEX IF NOT EXISTS idx_jobs_claimer ON jobs(claimer_id);
+  CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
+  CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+  CREATE INDEX IF NOT EXISTS idx_agents_wallet ON agents(wallet);
+`);
+
+db.prepare('INSERT OR IGNORE INTO sync_state (id, last_block) VALUES (1, ?)').run(Number(START_BLOCK));
+
+// Viem client
+const client = createPublicClient({
+  chain: base,
+  transport: http('https://mainnet.base.org'),
+});
+
+// Sync function
+async function syncEvents() {
+  const { last_block } = db.prepare('SELECT last_block FROM sync_state WHERE id = 1').get();
+  let currentBlock;
+  
+  try {
+    currentBlock = await client.getBlockNumber();
+  } catch (e) {
+    console.error('Failed to get block number:', e.message);
+    return;
+  }
+  
+  if (BigInt(last_block) >= currentBlock) {
+    console.log(`[${new Date().toISOString()}] Already synced to block ${last_block}`);
+    return;
+  }
+  
+  const fromBlock = BigInt(last_block) + 1n;
+  const toBlock = currentBlock;
+  
+  console.log(`[${new Date().toISOString()}] Syncing blocks ${fromBlock} to ${toBlock}...`);
+  
+  const CHUNK_SIZE = 5000n;
+  let from = fromBlock;
+  let totalEvents = 0;
+  
+  while (from <= toBlock) {
+    const to = from + CHUNK_SIZE > toBlock ? toBlock : from + CHUNK_SIZE;
+    
+    try {
+      const logs = await client.getLogs({
+        address: ESCROW_ADDRESS,
+        fromBlock: from,
+        toBlock: to,
+      });
+      
+      for (const log of logs) {
+        try {
+          const decoded = decodeEventLog({ abi, data: log.data, topics: log.topics });
+          await processDecodedLog(log, decoded);
+          totalEvents++;
+        } catch (e) {
+          // Skip logs we can't decode
+        }
+      }
+      
+      // Update sync state after each chunk
+      db.prepare('UPDATE sync_state SET last_block = ? WHERE id = 1').run(Number(to));
+      
+    } catch (e) {
+      console.error(`Error fetching ${from}-${to}:`, e.message);
+      // Continue with next chunk
+    }
+    
+    from = to + 1n;
+  }
+  
+  console.log(`[${new Date().toISOString()}] Sync complete. Processed ${totalEvents} events. Last block: ${toBlock}`);
+}
+
+async function processDecodedLog(log, decoded) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const blockNum = Number(log.blockNumber);
+  const args = decoded.args;
+  
+  // Store raw event
+  db.prepare(`
+    INSERT INTO events (event_type, job_id, agent_id, tx_hash, block_number, log_index, data, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    decoded.eventName,
+    args.jobId || null,
+    args.agentId || null,
+    log.transactionHash,
+    blockNum,
+    log.logIndex,
+    JSON.stringify({ ...args, eventName: decoded.eventName }),
+    timestamp
+  );
+  
+  // Process specific events
+  switch (decoded.eventName) {
+    case 'AgentRegistered':
+      db.prepare(`
+        INSERT OR REPLACE INTO agents (agent_id, name, wallet, registered_block, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(args.agentId, args.name, args.wallet, blockNum, timestamp);
+      break;
+      
+    case 'JobPosted':
+      db.prepare(`
+        INSERT OR REPLACE INTO jobs (job_id, title, poster_id, reward, status, created_block, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'open', ?, ?, ?)
+      `).run(args.jobId, args.title, args.posterId, args.reward?.toString(), blockNum, timestamp, timestamp);
+      break;
+      
+    case 'JobClaimed':
+      db.prepare(`
+        UPDATE jobs SET claimer_id = ?, status = 'claimed', claimed_block = ?, updated_at = ?
+        WHERE job_id = ?
+      `).run(args.claimerId, blockNum, timestamp, args.jobId);
+      break;
+      
+    case 'WorkSubmitted':
+      db.prepare(`
+        UPDATE jobs SET submission_hash = ?, status = 'submitted', submitted_block = ?, updated_at = ?
+        WHERE job_id = ?
+      `).run(args.submissionHash, blockNum, timestamp, args.jobId);
+      break;
+      
+    case 'JobVerified':
+      db.prepare(`
+        UPDATE jobs SET approved = ?, status = 'verified', verified_block = ?, updated_at = ?
+        WHERE job_id = ?
+      `).run(args.approved ? 1 : 0, blockNum, timestamp, args.jobId);
+      break;
+      
+    case 'JobCancelled':
+      db.prepare(`
+        UPDATE jobs SET status = 'cancelled', cancelled_block = ?, updated_at = ?
+        WHERE job_id = ?
+      `).run(blockNum, timestamp, args.jobId);
+      break;
+      
+    case 'ClaimExpired':
+      db.prepare(`
+        UPDATE jobs SET status = 'claim_expired', updated_at = ? WHERE job_id = ?
+      `).run(timestamp, args.jobId);
+      break;
+      
+    case 'VerifyExpired':
+      db.prepare(`
+        UPDATE jobs SET status = 'verify_expired', updated_at = ? WHERE job_id = ?
+      `).run(timestamp, args.jobId);
+      break;
+      
+    case 'EmergencyRelease':
+      db.prepare(`
+        UPDATE jobs SET status = 'emergency_released', updated_at = ? WHERE job_id = ?
+      `).run(timestamp, args.jobId);
+      break;
+  }
+}
+
+// API Routes
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Openwork Escrow Indexer API',
+    version: '1.0.0',
+    contract: ESCROW_ADDRESS,
+    chain: 'Base',
+    endpoints: {
+      'GET /jobs': 'List all escrow jobs',
+      'GET /jobs/:jobId': 'Get job details + event history',
+      'GET /agents/:address/jobs': 'Get jobs by agent wallet',
+      'GET /stats': 'Aggregate statistics',
+      'GET /events': 'Recent events',
+      'POST /sync': 'Trigger manual sync',
+    },
+    source: 'https://github.com/zombiepear/escrow-indexer',
+    built_by: 'RawClaw 🦞 (AgentHive)',
+  });
+});
+
+app.get('/jobs', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const offset = parseInt(req.query.offset) || 0;
+  const status = req.query.status;
+  
+  let query = 'SELECT * FROM jobs';
+  const params = [];
+  
+  if (status) {
+    query += ' WHERE status = ?';
+    params.push(status);
+  }
+  
+  query += ' ORDER BY created_block DESC LIMIT ? OFFSET ?';
+  params.push(limit, offset);
+  
+  const jobs = db.prepare(query).all(...params);
+  const total = db.prepare('SELECT COUNT(*) as count FROM jobs' + (status ? ' WHERE status = ?' : '')).get(...(status ? [status] : [])).count;
+  
+  res.json({ jobs, total, limit, offset });
+});
+
+app.get('/jobs/:jobId', (req, res) => {
+  let { jobId } = req.params;
+  
+  // Handle both raw hex and 0x-prefixed
+  if (!jobId.startsWith('0x')) {
+    jobId = '0x' + jobId;
+  }
+  
+  const job = db.prepare('SELECT * FROM jobs WHERE job_id = ? OR job_id = ?').get(jobId, jobId.toLowerCase());
+  
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found', jobId });
+  }
+  
+  const history = db.prepare('SELECT * FROM events WHERE job_id = ? ORDER BY block_number ASC, log_index ASC').all(job.job_id);
+  
+  res.json({ job, history });
+});
+
+app.get('/agents', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const agents = db.prepare('SELECT * FROM agents ORDER BY registered_block DESC LIMIT ?').all(limit);
+  const total = db.prepare('SELECT COUNT(*) as count FROM agents').get().count;
+  res.json({ agents, total });
+});
+
+app.get('/agents/:address/jobs', (req, res) => {
+  const { address } = req.params;
+  
+  // Try to find agent by wallet
+  const agent = db.prepare('SELECT * FROM agents WHERE LOWER(wallet) = ?').get(address.toLowerCase());
+  
+  let posted = [];
+  let claimed = [];
+  
+  if (agent) {
+    posted = db.prepare('SELECT * FROM jobs WHERE poster_id = ?').all(agent.agent_id);
+    claimed = db.prepare('SELECT * FROM jobs WHERE claimer_id = ?').all(agent.agent_id);
+  } else {
+    // Search by partial match on poster/claimer fields
+    posted = db.prepare('SELECT * FROM jobs WHERE LOWER(poster_id) LIKE ?').all(`%${address.toLowerCase().slice(2, 10)}%`);
+    claimed = db.prepare('SELECT * FROM jobs WHERE LOWER(claimer_id) LIKE ?').all(`%${address.toLowerCase().slice(2, 10)}%`);
+  }
+  
+  res.json({ address, agent, posted, claimed });
+});
+
+app.get('/stats', (req, res) => {
+  const jobCount = db.prepare('SELECT COUNT(*) as count FROM jobs').get().count;
+  const agentCount = db.prepare('SELECT COUNT(*) as count FROM agents').get().count;
+  const eventCount = db.prepare('SELECT COUNT(*) as count FROM events').get().count;
+  const { last_block } = db.prepare('SELECT last_block FROM sync_state WHERE id = 1').get();
+  
+  const statusCounts = db.prepare('SELECT status, COUNT(*) as count FROM jobs GROUP BY status').all();
+  const eventTypes = db.prepare('SELECT event_type, COUNT(*) as count FROM events GROUP BY event_type ORDER BY count DESC').all();
+  
+  const totalReward = db.prepare('SELECT SUM(CAST(reward AS INTEGER)) as total FROM jobs').get().total || 0;
+  
+  res.json({
+    contract: ESCROW_ADDRESS,
+    chain: 'Base (8453)',
+    total_jobs: jobCount,
+    total_agents: agentCount,
+    total_events: eventCount,
+    total_escrowed: totalReward.toString(),
+    last_synced_block: last_block,
+    job_status_breakdown: statusCounts,
+    event_type_breakdown: eventTypes,
+  });
+});
+
+app.get('/events', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const eventType = req.query.type;
+  
+  let query = 'SELECT * FROM events';
+  const params = [];
+  
+  if (eventType) {
+    query += ' WHERE event_type = ?';
+    params.push(eventType);
+  }
+  
+  query += ' ORDER BY block_number DESC, log_index DESC LIMIT ?';
+  params.push(limit);
+  
+  const events = db.prepare(query).all(...params);
+  res.json({ events, count: events.length });
+});
+
+app.post('/sync', async (req, res) => {
+  try {
+    await syncEvents();
+    const { last_block } = db.prepare('SELECT last_block FROM sync_state WHERE id = 1').get();
+    res.json({ success: true, last_block });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Start server
+const PORT = process.env.PORT || 3456;
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`\n🦞 Openwork Escrow Indexer running on port ${PORT}`);
+  console.log(`   Contract: ${ESCROW_ADDRESS}`);
+  console.log(`   Chain: Base\n`);
+  
+  // Initial sync
+  console.log('Starting initial sync...');
+  await syncEvents();
+  
+  // Periodic sync every 2 minutes
+  setInterval(syncEvents, 120000);
+});

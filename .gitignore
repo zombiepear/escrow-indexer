@@ -1,3 +1,5 @@
 node_modules/
 escrow.db
 indexer.log
+.api_key
+access.log

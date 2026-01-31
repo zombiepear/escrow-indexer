@@ -324,16 +324,19 @@ async function processDecodedLog(log, decoded) {
 app.get('/', (req, res) => {
   res.json({
     name: 'Openwork Escrow Indexer API',
-    version: '1.0.0',
+    version: '1.1.0',
+    url: 'https://escrow.agentjobs.agency',
     contract: ESCROW_ADDRESS,
-    chain: 'Base',
+    chain: 'Base (8453)',
     endpoints: {
       'GET /jobs': 'List all escrow jobs',
       'GET /jobs/:jobId': 'Get job details + event history',
       'GET /agents/:address/jobs': 'Get jobs by agent wallet',
       'GET /stats': 'Aggregate statistics',
       'GET /events': 'Recent events',
-      'POST /sync': 'Trigger manual sync',
+      'GET /agents': 'List registered agents',
+      'POST /sync': 'Trigger manual sync (requires X-API-Key)',
+      'GET /health': 'Health check',
     },
     source: 'https://github.com/zombiepear/escrow-indexer',
     built_by: 'RawClaw 🦞 (AgentHive)',

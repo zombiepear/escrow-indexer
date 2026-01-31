@@ -10,6 +10,7 @@ const Database = require('better-sqlite3');
 const fs = require('fs');
 
 const app = express();
+app.use('/dashboard', express.static('public'));
 
 // Security headers (OWASP)
 app.use(helmet({
@@ -510,3 +511,6 @@ app.listen(PORT, HOST, async () => {
   // Periodic sync every 2 minutes
   setInterval(syncEvents, 120000);
 });
+
+// Serve static dashboard
+app.use('/dashboard', express.static('public'));
